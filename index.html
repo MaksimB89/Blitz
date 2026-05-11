@@ -311,7 +311,7 @@ const state = {
   currentPlayingId: null,
   pendingDeleteId: null,
   mimeType: '',
-  maxDurationSec: 300, // 5 min hard cap (storage limit)
+  maxDurationSec: 600, // 10 min
 };
 
 const MAX_BARS = 32;
@@ -340,14 +340,58 @@ for (let i = 0; i < MAX_BARS; i++) {
 }
 const waveBars = els.wave.querySelectorAll('span');
 
-// ==================== Persistence ====================
-const META_KEY = 'notes_meta';
+// ==================== Persistence (IndexedDB) ====================
+let db = null;
+const DB_NAME = 'blitz_db';
+const DB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta');
+      if (!d.objectStoreNames.contains('audio')) d.createObjectStore('audio');
+    };
+    req.onsuccess = (e) => { db = e.target.result; resolve(db); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbGet(store, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbPut(store, key, value) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const req = tx.objectStore(store).put(value, key);
+    req.onsuccess = () => resolve(true);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbDelete(store, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const req = tx.objectStore(store).delete(key);
+    req.onsuccess = () => resolve(true);
+    req.onerror = () => reject(req.error);
+  });
+}
 
 async function loadNotes() {
   try {
-    const result = await window.storage.get(META_KEY);
-    state.notes = result ? JSON.parse(result.value) : [];
-  } catch {
+    await openDB();
+    const data = await idbGet('meta', 'notes');
+    state.notes = data || [];
+  } catch (e) {
+    console.error('DB load error:', e);
     state.notes = [];
   }
   renderList();
@@ -355,34 +399,32 @@ async function loadNotes() {
 
 async function saveMeta() {
   try {
-    await window.storage.set(META_KEY, JSON.stringify(state.notes));
+    await idbPut('meta', 'notes', state.notes);
   } catch (e) {
     toast('Speichern fehlgeschlagen', true);
   }
 }
 
-async function saveAudio(id, base64) {
+async function saveAudio(id, blob) {
   try {
-    const result = await window.storage.set('audio:' + id, base64);
-    if (!result) throw new Error('failed');
+    await idbPut('audio', id, blob);
     return true;
   } catch (e) {
-    toast('Audio zu groß für Speicher', true);
+    toast('Speichern fehlgeschlagen', true);
     return false;
   }
 }
 
 async function loadAudio(id) {
   try {
-    const result = await window.storage.get('audio:' + id);
-    return result ? result.value : null;
+    return await idbGet('audio', id);
   } catch {
     return null;
   }
 }
 
 async function deleteAudio(id) {
-  try { await window.storage.delete('audio:' + id); } catch {}
+  try { await idbDelete('audio', id); } catch {}
 }
 
 // ==================== Recording ====================
@@ -445,7 +487,7 @@ async function startRecording() {
   els.status.classList.add('live');
   els.timer.classList.add('live');
   els.wave.classList.add('live');
-  els.hint.textContent = 'Tippen zum Stoppen · max. 5:00';
+  els.hint.textContent = 'Tippen zum Stoppen · max. 10:00';
 
   if (navigator.vibrate) navigator.vibrate(20);
 
@@ -516,14 +558,6 @@ async function onRecordingStop() {
   }
 
   const blob = new Blob(state.audioChunks, { type: state.mimeType || 'audio/webm' });
-  const base64 = await blobToBase64(blob);
-
-  // Check size (~5MB hard limit for storage)
-  if (base64.length > 4_900_000) {
-    toast('Aufnahme zu groß – nicht gespeichert', true);
-    els.status.textContent = 'Bereit';
-    return;
-  }
 
   const id = 'n_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
   const note = {
@@ -531,10 +565,10 @@ async function onRecordingStop() {
     timestamp: Date.now(),
     duration,
     mime: state.mimeType || 'audio/webm',
-    size: base64.length,
+    size: blob.size,
   };
 
-  const ok = await saveAudio(id, base64);
+  const ok = await saveAudio(id, blob);
   if (!ok) { els.status.textContent = 'Bereit'; return; }
 
   state.notes.unshift(note);
@@ -544,14 +578,6 @@ async function onRecordingStop() {
   toast('Gespeichert · ' + formatDuration(duration));
 }
 
-function blobToBase64(blob) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result);
-    r.onerror = rej;
-    r.readAsDataURL(blob);
-  });
-}
 
 // ==================== Playback ====================
 async function togglePlay(id) {
@@ -568,7 +594,8 @@ async function togglePlay(id) {
   const data = await loadAudio(id);
   if (!data) { toast('Audio nicht gefunden', true); return; }
 
-  const audio = new Audio(data);
+  const url = URL.createObjectURL(data);
+  const audio = new Audio(url);
   state.currentAudio = audio;
   state.currentPlayingId = id;
 
@@ -592,6 +619,7 @@ async function togglePlay(id) {
       btn.classList.remove('playing');
       btn.innerHTML = playSVG();
       fill.style.width = '0%';
+      URL.revokeObjectURL(audio.src);
       state.currentAudio = null;
       state.currentPlayingId = null;
     };
@@ -763,15 +791,17 @@ async function doDelete() {
 async function downloadNote(id) {
   const note = state.notes.find(n => n.id === id);
   if (!note) return;
-  const data = await loadAudio(id);
-  if (!data) { toast('Audio nicht gefunden', true); return; }
+  const blob = await loadAudio(id);
+  if (!blob) { toast('Audio nicht gefunden', true); return; }
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = data;
+  a.href = url;
   const ext = note.mime.includes('mp4') ? 'm4a' : note.mime.includes('ogg') ? 'ogg' : 'webm';
   a.download = `blitz_${dateKey(note.timestamp)}_${formatTime(note.timestamp).replace(':','-')}.${ext}`;
   document.body.appendChild(a);
   a.click();
   a.remove();
+  URL.revokeObjectURL(url);
 }
 
 async function exportAll() {
